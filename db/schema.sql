@@ -19,3 +19,6 @@ CREATE TABLE wallet_transactions (
   balance_after  NUMERIC(14,2) NOT NULL,
   created_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX wallet_transactions_tx_id_uq ON wallet_transactions (tx_id);
+CREATE UNIQUE INDEX wallet_transactions_refund_once_uq ON wallet_transactions (ref_tx_id) WHERE type = 'casino_bet_refund';
