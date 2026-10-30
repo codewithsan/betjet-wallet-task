@@ -1,4 +1,4 @@
-import { Inject, Injectable, NotImplementedException } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 import { DbService } from "../db.service";
 import {
   CreditRequest,
@@ -91,7 +91,6 @@ export class WalletService {
     }
   }
 
-  // Already "done" by a previous developer. Pays out a win.
   async credit(req: CreditRequest): Promise<WalletResponse> {
     try {
       return await this.db.withTransaction<WalletResponse>(async (client) => {
@@ -140,9 +139,92 @@ export class WalletService {
     }
   }
 
-  // TODO: implement (see README)
-  async rollback(_req: RollbackRequest): Promise<WalletResponse> {
-    throw new NotImplementedException("rollback not implemented");
+  async rollback(req: RollbackRequest): Promise<WalletResponse> {
+    try {
+      return await this.db.withTransaction<WalletResponse>(async (client) => {
+        const wallet = await this.lockWallet(client, req.userId);
+        if (!wallet) return { status: "UNKNOWN_USER", txId: req.txId };
+
+        // Checking transaction already exists
+        const existing = await client.query(
+          `SELECT user_id = $2 AND type = 'casino_bet_refund' AND bet_id = $3 AND ref_tx_id = $4 AS same
+             FROM wallet_transactions
+            WHERE tx_id = $1`,
+          [req.txId, req.userId, req.betId, req.refTxId],
+        );
+
+        if (existing.rowCount) {
+          return existing.rows[0].same
+            ? { status: "OK", txId: req.txId, balance: wallet.balance }
+            : { status: "INVALID_REQUEST", txId: req.txId };
+        }
+
+        // Find the transaction being rolled back, by tx_id only, so that
+        // "not found" really means we haven't received it yet.
+        const ref = await client.query(
+          `SELECT user_id, type, amount FROM wallet_transactions WHERE tx_id = $1`,
+          [req.refTxId],
+        );
+
+        // Debit not received yet: refund nothing, but leave a 0-amount marker
+        // so the debit is rejected if it arrives later.
+        if (!ref.rowCount) {
+          await client.query(
+            `INSERT INTO wallet_transactions (tx_id, user_id, bet_id, type, amount, balance_after, ref_tx_id)
+             VALUES ($1, $2, $3, 'casino_bet_refund', 0, $4, $5)`,
+            [req.txId, req.userId, req.betId, wallet.balance, req.refTxId],
+          );
+          return { status: "OK", txId: req.txId, balance: wallet.balance };
+        }
+
+        // Only a debit, and only the same user's, can be refunded
+        const debit = ref.rows[0];
+        if (debit.type !== "casino_bet" || debit.user_id !== req.userId) {
+          return {
+            status: "INVALID_REQUEST",
+            txId: req.txId,
+            balance: wallet.balance,
+          };
+        }
+
+        // Only once: has another rollback already refunded this debit?
+        const refunded = await client.query(
+          `SELECT 1 FROM wallet_transactions
+            WHERE type = 'casino_bet_refund' AND ref_tx_id = $1`,
+          [req.refTxId],
+        );
+        if (refunded.rowCount) {
+          return {
+            status: "INVALID_REQUEST",
+            txId: req.txId,
+            balance: wallet.balance,
+          };
+        }
+
+        // Refund exactly what the debit took
+        const updated = await client.query(
+          `UPDATE wallets SET balance = balance + $1, updated_at = now()
+            WHERE user_id = $2
+           RETURNING balance`,
+          [debit.amount, req.userId],
+        );
+        const balance: string = updated.rows[0].balance;
+
+        // Write the ledger row
+        await client.query(
+          `INSERT INTO wallet_transactions (tx_id, user_id, bet_id, type, amount, balance_after, ref_tx_id)
+           VALUES ($1, $2, $3, 'casino_bet_refund', $4, $5, $6)`,
+          [req.txId, req.userId, req.betId, debit.amount, balance, req.refTxId],
+        );
+        return { status: "OK", txId: req.txId, balance };
+      });
+    } catch (err) {
+      // Same txId for another user, or two rollbacks for the same debit at once.
+      if ((err as { code?: string }).code === UNIQUE_VIOLATION) {
+        return { status: "INVALID_REQUEST", txId: req.txId };
+      }
+      throw err;
+    }
   }
 
   private async lockWallet(client: PoolClient, userId: number) {
