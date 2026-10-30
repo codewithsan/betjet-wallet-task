@@ -23,9 +23,72 @@ export class WalletService {
     return { status: "OK", balance: res.rows[0].balance };
   }
 
-  // TODO: implement (see README)
-  async debit(_req: DebitRequest): Promise<WalletResponse> {
-    throw new NotImplementedException("debit not implemented");
+  async debit(req: DebitRequest): Promise<WalletResponse> {
+    try {
+      return await this.db.withTransaction<WalletResponse>(async (client) => {
+        // Lock the user's wallet row
+        const wallet = await this.lockWallet(client, req.userId);
+        if (!wallet) return { status: "UNKNOWN_USER", txId: req.txId };
+
+        // Checking transaction already exists
+        const existing = await client.query(
+          `SELECT user_id = $2 AND type = 'casino_bet' AND bet_id = $3 AND amount = $4::numeric AS same
+             FROM wallet_transactions
+            WHERE tx_id = $1`,
+          [req.txId, req.userId, req.betId, req.amount],
+        );
+        if (existing.rowCount) {
+          return existing.rows[0].same
+            ? { status: "OK", txId: req.txId, balance: wallet.balance }
+            : { status: "INVALID_REQUEST", txId: req.txId };
+        }
+
+        // Was this bet already cancelled by a rollback that arrived first?
+        const cancelled = await client.query(
+          `SELECT 1 FROM wallet_transactions
+            WHERE type = 'casino_bet_refund' AND ref_tx_id = $1 AND user_id = $2`,
+          [req.txId, req.userId],
+        );
+        if (cancelled.rowCount) {
+          return {
+            status: "INVALID_REQUEST",
+            txId: req.txId,
+            balance: wallet.balance,
+          };
+        }
+
+        // Take the stake, only if spendable money covers it
+        const updated = await client.query(
+          `UPDATE wallets SET balance = balance - $1::numeric, updated_at = now()
+            WHERE user_id = $2 AND balance - locked_exposure >= $1::numeric
+           RETURNING balance`,
+          [req.amount, req.userId],
+        );
+        if (!updated.rowCount) {
+          return {
+            status: "INSUFFICIENT_FUNDS",
+            txId: req.txId,
+            balance: wallet.balance,
+          };
+        }
+        const balance: string = updated.rows[0].balance;
+
+        // Write the ledger row
+        await client.query(
+          `INSERT INTO wallet_transactions (tx_id, user_id, bet_id, type, amount, balance_after)
+           VALUES ($1, $2, $3, 'casino_bet', $4, $5)`,
+          [req.txId, req.userId, req.betId, req.amount, balance],
+        );
+
+        return { status: "OK", txId: req.txId, balance };
+      });
+    } catch (err) {
+      // Same txId sent at the same moment for a different user.
+      if ((err as { code?: string }).code === UNIQUE_VIOLATION) {
+        return { status: "INVALID_REQUEST", txId: req.txId };
+      }
+      throw err;
+    }
   }
 
   // Already "done" by a previous developer. Pays out a win.
